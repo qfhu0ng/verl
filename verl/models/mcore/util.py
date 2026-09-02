@@ -475,12 +475,12 @@ def preprocess_thd_engine(
             start_idx = cu_seqlens_padded_cpu[i] // cp_size
             # split to 2 chunks
             d = input_ids[i]
-            # Alignment applies to the sequence dimension. Extra trailing
-            # dimensions (for example top-k teacher logits) must not affect
-            # whether a short sequence is padded.
-            if d.shape[0] < align_size:
+            # Pad to the full per-seq padded length so every CP rank gets a
+            # full slice; align_size alone is too short for the CP split end.
+            pad_target = max(align_size, seqlen_padded_i)
+            if d.shape[0] < pad_target:
                 original_size = d.shape[0]
-                pad = torch.zeros((align_size - d.shape[0], *d.shape[1:]), dtype=d.dtype, device=d.device)
+                pad = torch.zeros((pad_target - d.shape[0], *d.shape[1:]), dtype=d.dtype, device=d.device)
                 d = torch.cat([d, pad], dim=0)
                 logger.warning_once(
                     f"Padding tensor for context parallel alignment, original_size={original_size}, "

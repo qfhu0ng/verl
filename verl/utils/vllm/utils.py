@@ -246,6 +246,8 @@ def resolve_weight_name(model, name: str, model_weight_names: set[str]) -> str:
     # Per-expert routed leaf: ``mlp.experts.<id>.<proj>[.base_layer].<leaf>``.
     # The numeric ``<id>`` is not a child module, so the leaf needs the
     # loader-specific form below; strict loaders keep the suffix verbatim.
+    # Scale companions (weight_scale/weight_scale_inv) must carry the same
+    # .base_layer suffix as their weight so the expert mapping matches both.
     marker = ".mlp.experts."
     idx = name.find(marker)
     if idx != -1:
@@ -253,7 +255,7 @@ def resolve_weight_name(model, name: str, model_weight_names: set[str]) -> str:
         is_per_expert_leaf = (
             tail
             and tail.split(".", 1)[0].isdigit()
-            and is_leaf
+            and (is_leaf or leaf in ("weight_scale", "weight_scale_inv"))
             and any("mlp.experts.base_layer." in n for n in model_weight_names)
         )
         if is_per_expert_leaf:
@@ -263,6 +265,12 @@ def resolve_weight_name(model, name: str, model_weight_names: set[str]) -> str:
                     prefix, lf = head.rsplit(".", 1)
                     alt = f"{prefix}.base_layer.{lf}"
                     if alt in model_weight_names:
+                        return alt
+                    # lora_base_layer_prefix appends .base_layer. to
+                    # checkpoint-side expert names. The live fused expert param is
+                    # not a per-expert path, so alt isn't a live name — but the
+                    # mapping needs the suffix to substring-match. Inject it.
+                    if _HAS_LORA_BASE_LAYER_PREFIX:
                         return alt
                 return name
             # Flat loaders match the checkpoint-side ``weight_name`` of the
