@@ -40,6 +40,7 @@ import verl.utils.tokenizer.continuous_token as continuous_token_module
 import verl.utils.tokenizer.continuous_token_wiring as continuous_token_wiring_module
 from tests.utils.test_continuous_token_on_cpu import (
     _DeepSeekAssistantTokenizer,
+    _Gemma4BoundaryTokenizer,
     _MiniMaxVLAssistantTokenizer,
     _MockMiniMaxVLAssistantProcessor,
     _MockQwenVLProcessor,
@@ -359,53 +360,143 @@ def test_multiturn_sft_kimi_preserves_plain_turns(kimi_sft_dataset_factory, bloc
     assert result["position_ids"].tolist() == list(range(len(result["input_ids"])))
 
 
-@pytest.mark.parametrize("trainer_name", ["sft_trainer", "sft_trainer_ray"])
-@pytest.mark.parametrize("dataset_kind", ["default", "subclass", "unrelated"])
-def test_trainer_dataset_factory_preserves_family_for_subclasses(trainer_name, dataset_kind, tmp_path, monkeypatch):
-    import verl.utils.import_utils as import_utils
-
-    class CustomDataset(MultiTurnSFTDataset):
-        pass
-
-    class UnrelatedDataset:
-        def __init__(self, parquet_files, tokenizer, config, processor, max_samples):
-            pass
-
+@pytest.fixture(params=["sft_trainer", "sft_trainer_ray"])
+def trainer_dataset_factory(request):
     # Execute the actual factory without importing GPU trainer dependencies.
-    # The dataset class, family resolver, and rejection path are production code.
-    source_path = Path(__file__).resolve().parents[3] / "verl" / "trainer" / f"{trainer_name}.py"
+    source_path = Path(__file__).resolve().parents[3] / "verl" / "trainer" / f"{request.param}.py"
     tree = ast.parse(source_path.read_text())
     factory = next(
         node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "create_sft_dataset"
     )
     namespace = {"MultiTurnSFTDataset": MultiTurnSFTDataset}
     exec(compile(ast.Module(body=[factory], type_ignores=[]), str(source_path), "exec"), namespace)
+    return namespace["create_sft_dataset"]
 
-    custom_cls = CustomDataset if dataset_kind == "subclass" else UnrelatedDataset
-    monkeypatch.setattr(import_utils, "load_extern_object", lambda *args: custom_cls)
-    monkeypatch.setattr(import_utils, "load_extern_type", lambda *args: custom_cls)
-    config = OmegaConf.create(
-        {
-            "custom_cls": {"path": None if dataset_kind == "default" else "custom.py", "name": "CustomDataset"},
-            "continuous_token_model_family": "auto",
-        }
+
+@pytest.fixture
+def trainer_factory_inputs(tmp_path):
+    custom_file = tmp_path / "custom_dataset.py"
+    custom_file.write_text(
+        """from verl.utils.dataset.multiturn_sft_dataset import MultiTurnSFTDataset
+
+class InheritedDataset(MultiTurnSFTDataset):
+    pass
+
+class LegacyInitDataset(MultiTurnSFTDataset):
+    def __init__(self, parquet_files, tokenizer, config, processor=None, max_samples=-1):
+        super().__init__(parquet_files, tokenizer, config, processor, max_samples)
+        self.builder_in_init = self._get_continuous_token_builder(None)
+
+class KwargsDataset(MultiTurnSFTDataset):
+    def __init__(self, parquet_files, tokenizer, config, processor=None, max_samples=-1, **kwargs):
+        super().__init__(parquet_files, tokenizer, config, processor, max_samples, **kwargs)
+        self.builder_in_init = self._get_continuous_token_builder(None)
+
+class UnrelatedDataset:
+    def __init__(self, parquet_files, tokenizer, config, processor, max_samples):
+        self.config = config
+"""
     )
-    data_file = tmp_path / "text01.parquet"
+    data_file = tmp_path / "factory.parquet"
     pd.DataFrame({"messages": [[{"role": "user", "content": "q"}, {"role": "assistant", "content": "a"}]]}).to_parquet(
         data_file
     )
 
+    def inputs(dataset_kind, model_family="auto"):
+        config = OmegaConf.create(
+            {
+                "sequence_length": 128,
+                "data": {
+                    "custom_cls": {
+                        "path": None if dataset_kind == "default" else str(custom_file),
+                        "name": dataset_kind,
+                    },
+                    "max_length": "${sequence_length}",
+                    "pad_mode": "no_padding",
+                },
+            }
+        )
+        if model_family is not None:
+            config.data.continuous_token_model_family = model_family
+        OmegaConf.set_struct(config, True)
+        OmegaConf.set_readonly(config, True)
+        return str(data_file), config.data
+
+    return inputs
+
+
+@pytest.mark.parametrize(
+    "dataset_kind", ["default", "InheritedDataset", "LegacyInitDataset", "KwargsDataset", "UnrelatedDataset"]
+)
+@pytest.mark.parametrize("model_type, diagnostic", [("minimax", "MiniMax-Text-01"), ("deepseek_vl_v2", "DeepSeek-VL2")])
+def test_trainer_dataset_factory_preserves_family_refusal(
+    trainer_dataset_factory, trainer_factory_inputs, dataset_kind, model_type, diagnostic, monkeypatch
+):
+    data_file, config = trainer_factory_inputs(dataset_kind)
+    original_config = OmegaConf.to_container(config, resolve=False)
+
     def unexpected_builder(*args, **kwargs):
-        pytest.fail("Text-01 bypassed the SFT refusal through a dataset subclass")
+        pytest.fail("Unsupported family bypassed the SFT refusal through a dataset subclass")
 
     monkeypatch.setattr(multiturn_sft_dataset_module, "create_continuous_token_builder", unexpected_builder)
-    dataset = namespace["create_sft_dataset"](str(data_file), config, object(), None, hf_model_type="minimax")
-    if dataset_kind == "unrelated":
-        assert isinstance(dataset, UnrelatedDataset)
+    if dataset_kind == "UnrelatedDataset":
+        dataset = trainer_dataset_factory(data_file, config, object(), None, hf_model_type=model_type)
+        assert dataset.config is config
     else:
-        assert dataset.hf_model_type == "minimax"
-        with pytest.raises(ValueError, match="MultiTurnSFTDataset does not support MiniMax-Text-01"):
+        # Legacy/kwargs constructors request the builder eagerly; inherited/default ones do so on indexing.
+        with pytest.raises(ValueError, match=f"MultiTurnSFTDataset does not support {diagnostic}"):
+            dataset = trainer_dataset_factory(data_file, config, object(), None, hf_model_type=model_type)
             dataset[0]
+    assert OmegaConf.to_container(config, resolve=False) == original_config
+    assert OmegaConf.is_struct(config) and OmegaConf.is_readonly(config)
+
+
+@pytest.mark.parametrize("dataset_kind", ["LegacyInitDataset", "KwargsDataset"])
+@pytest.mark.parametrize(
+    "model_family, model_type, multimodal, expected_builder",
+    [
+        (None, "qwen3", False, continuous_token_module.QwenContinuousTokenBuilder),
+        ("qwen3", "minimax", False, continuous_token_module.QwenContinuousTokenBuilder),
+        ("auto", "qwen3_5", False, continuous_token_module.QwenContinuousTokenBuilder),
+        ("auto", "qwen3_5", True, continuous_token_module.QwenVLContinuousTokenBuilder),
+        ("auto", "gemma4", False, continuous_token_module.Gemma4ContinuousTokenBuilder),
+        ("auto", "gemma4", True, continuous_token_module.Gemma4VLContinuousTokenBuilder),
+    ],
+)
+def test_trainer_dataset_factory_routes_during_custom_construction(
+    trainer_dataset_factory,
+    trainer_factory_inputs,
+    dataset_kind,
+    model_family,
+    model_type,
+    multimodal,
+    expected_builder,
+):
+    data_file, config = trainer_factory_inputs(dataset_kind, model_family)
+    original_config = OmegaConf.to_container(config, resolve=False)
+    tokenizer = _Gemma4BoundaryTokenizer() if model_type == "gemma4" else _QwenBoundaryTokenizer()
+    processor = _MockQwenVLProcessor() if multimodal else None
+    dataset = trainer_dataset_factory(data_file, config, tokenizer, processor, hf_model_type=model_type)
+    assert type(dataset.builder_in_init) is expected_builder
+    assert dataset.max_length == 128  # Parent-based interpolation survives the copied config.
+    assert OmegaConf.to_container(config, resolve=False) == original_config
+    assert OmegaConf.is_struct(config) and OmegaConf.is_readonly(config)
+
+
+@pytest.mark.parametrize(
+    "model_path",
+    [Path(os.environ.get("VERL_TEST_QWEN25_MODEL", custom_model_prefix / "Qwen/Qwen2.5-0.5B"))],
+)
+def test_trainer_dataset_factory_legacy_constructor_reads_real_sample(
+    trainer_dataset_factory, trainer_factory_inputs, model_path
+):
+    data_file, config = trainer_factory_inputs("LegacyInitDataset")
+    tokenizer = hf_tokenizer(model_path)
+    dataset = trainer_dataset_factory(data_file, config, tokenizer, None, hf_model_type="qwen2")
+    item = dataset[0]
+    assert item["input_ids"].shape == item["loss_mask"].shape == item["position_ids"].shape
+    expected_assistant_ids = tokenizer.encode("a", add_special_tokens=False) + [tokenizer.eos_token_id]
+    assert item["input_ids"][item["loss_mask"].bool()].tolist() == expected_assistant_ids
 
 
 def test_multiturn_sft_drops_arrow_null_message_fields():

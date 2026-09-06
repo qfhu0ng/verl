@@ -646,6 +646,46 @@ def test_gemma4_builder_does_not_add_trailing_newline_to_empty_reasoning():
     )
 
 
+@pytest.mark.parametrize("trailing_whitespace", ["", "\n", "\n\n", " \n\t"])
+@pytest.mark.parametrize("with_tool_call", [False, True])
+def test_gemma4_builder_preserves_embedded_thought_whitespace(trailing_whitespace, with_tool_call):
+    tokenizer = _Gemma4AssistantTokenizer()
+    builder = Gemma4ContinuousTokenBuilder(tokenizer, chat_template_kwargs={"enable_thinking": True})
+    thought = f"<|channel>thought\nreason{trailing_whitespace}<channel|>"
+    message = {"role": "assistant", "content": thought + ("" if with_tool_call else "done")}
+    if with_tool_call:
+        message["tool_calls"] = [{"type": "function", "function": {"name": "lookup", "arguments": {}}}]
+    expected_tail = "<|tool_call>call:lookup{}<tool_call|>" if with_tool_call else "done<turn|>"
+
+    assert reconstruct_assistant_tokens(builder, message) == tokenizer.encode(
+        thought + expected_tail, add_special_tokens=False
+    )
+
+
+@pytest.mark.parametrize("field", ["thinking", "reasoning_content", "reasoning"])
+@pytest.mark.parametrize("explicit_reasoning", ["", "override\n"])
+def test_gemma4_embedded_thought_keeps_explicit_reasoning_precedence(field, explicit_reasoning):
+    tokenizer = _Gemma4AssistantTokenizer()
+    builder = Gemma4ContinuousTokenBuilder(tokenizer, chat_template_kwargs={"enable_thinking": True})
+    embedded = "<|channel>thought\nembedded\n<channel|>"
+    message = {"role": "assistant", "content": embedded + "done", field: explicit_reasoning}
+    # Preserve the existing empty-field fallback. Standalone nonempty reasoning
+    # still receives the template separator, even if its text ends with a newline.
+    expected_thought = f"<|channel>thought\n{explicit_reasoning}\n<channel|>" if explicit_reasoning else embedded
+
+    assert reconstruct_assistant_tokens(builder, message) == tokenizer.encode(
+        expected_thought + "done<turn|>", add_special_tokens=False
+    )
+
+
+def test_gemma4_embedded_thought_keeps_disabled_thinking_scaffold():
+    tokenizer = _Gemma4AssistantTokenizer()
+    builder = Gemma4ContinuousTokenBuilder(tokenizer, chat_template_kwargs={"enable_thinking": False})
+    message = {"role": "assistant", "content": "<|channel>thought\nreason\n<channel|>done"}
+
+    assert reconstruct_assistant_tokens(builder, message) == tokenizer.encode("done<turn|>", add_special_tokens=False)
+
+
 def test_gemma4_e4b_builder_uses_template_reasoning_without_duplicate_scaffold():
     tokenizer = _Gemma4E4BAssistantTokenizer()
     builder = Gemma4ContinuousTokenBuilder(tokenizer, chat_template_kwargs={"enable_thinking": False})
@@ -678,6 +718,87 @@ def test_deepseek_v4_builder_encodes_assistant_with_native_protocol(enable_think
 
     expected_text = "reason</think>gold<｜end▁of▁sentence｜>" if enable_thinking else "gold<｜end▁of▁sentence｜>"
     assert assistant_ids == tokenizer.encode(expected_text, add_special_tokens=False)
+
+
+@pytest.mark.parametrize("task", ["action", "query", "authority", "domain", "title", "read_url"])
+@pytest.mark.parametrize("enable_thinking", [False, True])
+def test_deepseek_v4_task_merge_encodes_only_gold_continuation(task, enable_thinking, monkeypatch):
+    tokenizer = _DeepSeekAssistantTokenizer()
+    builder = DeepSeekV4ContinuousTokenBuilder(tokenizer, chat_template_kwargs={"enable_thinking": enable_thinking})
+    previous = [{"role": "user", "content": "question", "task": task}]
+    original_previous = copy.deepcopy(previous)
+    runtime_ids = builder.build_initial_tokens(previous)
+    original_runtime = list(runtime_ids)
+    message = {"role": "assistant", "reasoning_content": "ignored for a task", "content": "gold"}
+    expected_text = "gold<｜end▁of▁sentence｜>"
+    expected_ids = tokenizer.encode(expected_text, add_special_tokens=False)
+    encode = tokenizer.encode
+    encoded_texts = []
+
+    def record_encode(text, **kwargs):
+        encoded_texts.append(text)
+        return encode(text, **kwargs)
+
+    monkeypatch.setattr(tokenizer, "encode", record_encode)
+    result = builder.merge_assistant_with_tokenization(runtime_ids, message, previous_messages=previous)
+    mask, _ = builder.align_response_metadata(result, [0] * len(runtime_ids))
+
+    assert result.token_ids == original_runtime + expected_ids
+    assert mask == [0] * len(original_runtime) + [1] * len(expected_ids)
+    assert encoded_texts == [expected_text]
+    assert runtime_ids == original_runtime
+    assert previous == original_previous
+
+
+@pytest.mark.parametrize(
+    ("previous", "expected_text"),
+    [
+        ([{"role": "user", "content": "question"}], "reason</think>gold<｜end▁of▁sentence｜>"),
+        (
+            [
+                {"role": "user", "content": "question", "task": "query"},
+                {"role": "latest_reminder", "content": "remember"},
+            ],
+            "reason</think>gold<｜end▁of▁sentence｜>",
+        ),
+        (
+            [
+                {"role": "user", "content": "question"},
+                {"role": "latest_reminder", "content": "remember", "task": "title"},
+            ],
+            "gold<｜end▁of▁sentence｜>",
+        ),
+    ],
+)
+def test_deepseek_v4_task_scope_is_the_immediate_predecessor(previous, expected_text):
+    tokenizer = _DeepSeekAssistantTokenizer()
+    builder = DeepSeekV4ContinuousTokenBuilder(tokenizer, chat_template_kwargs={"enable_thinking": True})
+    message = {"role": "assistant", "reasoning_content": "reason", "content": "gold"}
+
+    assert reconstruct_assistant_tokens(builder, message, previous_messages=previous) == tokenizer.encode(
+        expected_text, add_special_tokens=False
+    )
+
+
+def test_deepseek_v4_task_continuation_keeps_native_tool_calls():
+    tokenizer = _DeepSeekAssistantTokenizer()
+    builder = DeepSeekV4ContinuousTokenBuilder(tokenizer, chat_template_kwargs={"enable_thinking": True})
+    message = {
+        "role": "assistant",
+        "reasoning_content": "ignored for a task",
+        "content": "",
+        "tool_calls": [{"type": "function", "function": {"name": "lookup", "arguments": {"q": "x"}}}],
+    }
+    tools = [{"type": "function", "function": {"name": "lookup"}}]
+    expected_text = (
+        '\n\n<｜DSML｜tool_calls>\n<｜DSML｜invoke name="lookup">\n'
+        '<｜DSML｜parameter name="q" string="true">x</｜DSML｜parameter>\n'
+        "</｜DSML｜invoke>\n</｜DSML｜tool_calls><｜end▁of▁sentence｜>"
+    )
+
+    assert reconstruct_assistant_tokens(
+        builder, message, tools=tools, previous_messages=[{"role": "user", "content": "question", "task": "action"}]
+    ) == tokenizer.encode(expected_text, add_special_tokens=False)
 
 
 @pytest.mark.parametrize(

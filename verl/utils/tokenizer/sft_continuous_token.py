@@ -263,11 +263,10 @@ class _AssistantReconstructor:
         tools: list[dict[str, Any]] | None,
         previous_messages: list[dict[str, Any]] | None,
     ) -> list[int]:
-        del previous_messages
         self._require_assistant(message)
 
         rendered_message = self._prepare_message(message)
-        synthetic_prompt = [_SYNTHETIC_SYSTEM_MESSAGE, _SYNTHETIC_USER_MESSAGE]
+        synthetic_prompt = self._reconstruction_context(previous_messages)
         prompt_text = self._render_text(synthetic_prompt, add_generation_prompt=True, tools=tools)
         completed_text = self._render_text(
             [*synthetic_prompt, rendered_message],
@@ -287,6 +286,10 @@ class _AssistantReconstructor:
         if not assistant_token_ids:
             raise ValueError("Continuous Token assistant encoding produced an empty token-id suffix")
         return self._normalize_ids(assistant_token_ids, message)
+
+    def _reconstruction_context(self, previous_messages: list[dict[str, Any]] | None) -> list[dict[str, Any]]:
+        del previous_messages
+        return [_SYNTHETIC_SYSTEM_MESSAGE, _SYNTHETIC_USER_MESSAGE]
 
     @staticmethod
     def _require_assistant(message: dict[str, Any]) -> None:
@@ -599,10 +602,12 @@ class _Gemma4Reconstructor(_AssistantReconstructor):
         content = _stringify_tool_content(message.get("content", ""))
         thought_open = "<|channel>thought\n"
         thought_close = "<channel|>"
+        embedded_thought = None
         if content.startswith(thought_open) and thought_close in content:
             embedded_reasoning, content = content[len(thought_open) :].split(thought_close, 1)
             if not reasoning:
                 reasoning = embedded_reasoning
+                embedded_thought = thought_open + embedded_reasoning + thought_close
             rendered_message["content"] = content
 
         prompt_delta, completed_delta = self._render_turn_deltas(rendered_message, tools=tools)
@@ -620,7 +625,8 @@ class _Gemma4Reconstructor(_AssistantReconstructor):
                 assistant_text = completed_body
             elif reasoning or self.builder.chat_template_kwargs.get("enable_thinking", False):
                 reasoning_suffix = f"{reasoning}\n" if reasoning else ""
-                assistant_text = thought_open + reasoning_suffix + thought_close + completed_body
+                # Embedded thoughts already carry their original separator whitespace.
+                assistant_text = (embedded_thought or thought_open + reasoning_suffix + thought_close) + completed_body
             else:
                 assistant_text = completed_body
         else:
@@ -751,6 +757,14 @@ class _DeepSeekReconstructor(_AssistantReconstructor):
 
 
 class _DeepSeekV4Reconstructor(_AssistantReconstructor):
+    def _reconstruction_context(self, previous_messages: list[dict[str, Any]] | None) -> list[dict[str, Any]]:
+        context = super()._reconstruction_context(previous_messages)
+        # Native task outputs suppress reasoning only when the immediate predecessor
+        # carries a task; a later reminder without a task restores the normal scaffold.
+        if previous_messages and previous_messages[-1].get("task"):
+            context[-1] = {**context[-1], "task": previous_messages[-1]["task"]}
+        return context
+
     def _render_text(
         self,
         messages: list[dict[str, Any]],
