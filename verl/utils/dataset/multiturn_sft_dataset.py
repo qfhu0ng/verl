@@ -37,12 +37,13 @@ from verl.utils.dataset.vision_utils import process_image, process_video
 from verl.utils.fs import copy_local_path_from_hdfs
 from verl.utils.py_functional import convert_nested_value_to_list_recursive
 from verl.utils.tokenizer import build_multimodal_processor_inputs, get_processor_token_id
-from verl.utils.tokenizer.continuous_token import ContinuousTokenBuilder
+from verl.utils.tokenizer.continuous_token import ContinuousTokenBuilder, MiniMaxVLContinuousTokenBuilder
 from verl.utils.tokenizer.continuous_token_wiring import (
     ContinuousTokenModelFamily,
     create_continuous_token_builder,
     resolve_continuous_token_model_family,
 )
+from verl.utils.tokenizer.sft_continuous_token import adapt_continuous_token_builder_for_sft, validate_sft_tool_support
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
@@ -124,9 +125,8 @@ class MultiTurnSFTDataset(Dataset):
         self.messages_key = config.get("messages_key", "messages")
         self.image_key = config.get("image_key", "images")
         self.video_key = config.get("video_key", "videos")
-        self.image_patch_size = config.get(
-            "image_patch_size", processor.image_processor.patch_size if processor else None
-        )
+        image_processor = getattr(processor, "image_processor", processor)
+        self.image_patch_size = config.get("image_patch_size", getattr(image_processor, "patch_size", None))
         self.tools_key = config.get("tools_key", "tools")
         self.enable_thinking_key = config.get("enable_thinking_key", "enable_thinking")
         self.enable_thinking_default = config.get("enable_thinking_default", None)
@@ -216,10 +216,19 @@ class MultiTurnSFTDataset(Dataset):
                     "For a MiniMax-M2 checkpoint, select family 'minimaxm2'. "
                     "Use a supported model family or a custom SFT dataset for this model."
                 )
+            if model_family == ContinuousTokenModelFamily.DEEPSEEK_VL2:
+                raise ValueError(
+                    "MultiTurnSFTDataset does not support DeepSeek-VL2. "
+                    "Use a supported model family or a custom SFT dataset for this model."
+                )
             apply_chat_template_kwargs = dict(self.apply_chat_template_kwargs)
             if enable_thinking is not None:
                 apply_chat_template_kwargs["enable_thinking"] = enable_thinking
-            self._continuous_token_builders[enable_thinking] = create_continuous_token_builder(
+            if model_family == ContinuousTokenModelFamily.MINIMAX_VL:
+                # The tokenizer template includes MiniMax's native function protocol.
+                apply_chat_template_kwargs.setdefault("chat_template", self.tokenizer.chat_template)
+                apply_chat_template_kwargs.pop("tools", None)
+            builder = create_continuous_token_builder(
                 self.tokenizer,
                 model_family=model_family,
                 hf_model_type=self.hf_model_type,
@@ -227,6 +236,7 @@ class MultiTurnSFTDataset(Dataset):
                 mm_processor_kwargs=self.mm_processor_kwargs,
                 processor=self.processor,
             )
+            self._continuous_token_builders[enable_thinking] = adapt_continuous_token_builder_for_sft(builder)
         return self._continuous_token_builders[enable_thinking]
 
     @staticmethod
@@ -268,6 +278,10 @@ class MultiTurnSFTDataset(Dataset):
             raise ValueError("MultiTurnSFTDataset requires at least one message")
 
         builder = self._get_continuous_token_builder(enable_thinking)
+        if isinstance(builder, MiniMaxVLContinuousTokenBuilder):
+            tools = tools or self.apply_chat_template_kwargs.get("tools")
+        # Validate the whole row before rendering, including prompts and trailing tool results.
+        validate_sft_tool_support(builder, messages, tools=tools)
         first_assistant_index = next(
             (index for index, message in enumerate(messages) if message.get("role") == "assistant"),
             len(messages),

@@ -44,7 +44,7 @@ from .continuous_token import (
     MiniMaxVLContinuousTokenBuilder,
     QwenContinuousTokenBuilder,
     VLContinuousTokenMixin,
-    _copy_messages_for_template,
+    _resolve_required_tool_name,
     _stringify_tool_content,
     require_token_id,
 )
@@ -55,6 +55,201 @@ from .deepseek import (
     encode_messages,
 )
 from .tokenizer import normalize_token_ids
+
+
+def _copy_messages_for_template(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Copy message containers without duplicating image, video, or audio payloads."""
+    copied_messages = []
+    for message in messages:
+        copied_message = dict(message)
+        content = message.get("content")
+        if isinstance(content, list):
+            copied_message["content"] = [dict(block) if isinstance(block, dict) else block for block in content]
+        copied_messages.append(copied_message)
+    return copied_messages
+
+
+class _SFTMiniMaxVLContinuousTokenBuilder(MiniMaxVLContinuousTokenBuilder):
+    """Render MiniMax-VL gold conversations without changing runtime builders."""
+
+    def render_tokens_with_mm(
+        self,
+        messages: list[dict[str, Any]],
+        images: list[Any],
+        *,
+        videos: list[Any] | None = None,
+        audios: list[Any] | None = None,
+        add_generation_prompt: bool = True,
+        tools: list[dict[str, Any]] | None = None,
+    ) -> list[int]:
+        return super().render_tokens_with_mm(
+            messages,
+            images,
+            videos=videos,
+            audios=audios,
+            add_generation_prompt=add_generation_prompt,
+            tools=[tool.get("function", tool) for tool in tools] if tools else None,
+        )
+
+    def _tokenize_tool_group(
+        self,
+        tool_messages: list[dict[str, Any]],
+        *,
+        previous_messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]] | None = None,
+        add_generation_prompt: bool = False,
+    ) -> list[int]:
+        del tools
+        function_messages = []
+        for index, message in enumerate(tool_messages):
+            name = _resolve_required_tool_name(message, index, tool_messages, previous_messages)
+            content = _stringify_tool_content(message.get("content", ""))
+            function_messages.append({"role": "function", "name": name, "content": [{"type": "text", "text": content}]})
+        # The tokenizer template supports native function responses; the legacy
+        # processor template does not. Keep the processor's generation scaffold.
+        token_ids = normalize_token_ids(
+            apply_chat_template(
+                self.tokenizer,
+                function_messages,
+                tokenize=True,
+                add_generation_prompt=False,
+                **self.chat_template_kwargs,
+            )
+        )
+        if add_generation_prompt:
+            token_ids.extend(self._vl_scaffold_ids)
+        return token_ids
+
+    def _tokenize_single_non_tool(
+        self,
+        message: dict[str, Any],
+        *,
+        tools: list[dict[str, Any]] | None = None,
+        add_generation_prompt: bool = False,
+    ) -> list[int]:
+        # Tool declarations belong to the initial prompt, not an appended user/system turn.
+        return super()._tokenize_single_non_tool(message, tools=None, add_generation_prompt=add_generation_prompt)
+
+
+class _SFTDeepSeekV4ContinuousTokenBuilder(DeepSeekV4ContinuousTokenBuilder):
+    """Keep committed SFT tokens when appending a new DeepSeek-V4 turn."""
+
+    def _assert_prefix_is_stable(
+        self,
+        previous_messages: list[dict[str, Any]],
+        *,
+        tools: list[dict[str, Any]] | None,
+    ) -> None:
+        # SFT retains its committed prefix, matching the official encoder's
+        # context-based append API. drop_thinking still governs initial renders;
+        # it must not retroactively delete earlier supervised reasoning tokens.
+        pass
+
+
+def adapt_continuous_token_builder_for_sft(builder: ContinuousTokenBuilder) -> ContinuousTokenBuilder:
+    """Adapt validated runtime builders for gold SFT conversation assembly."""
+    if type(builder) is MiniMaxVLContinuousTokenBuilder:
+        return _SFTMiniMaxVLContinuousTokenBuilder(
+            builder.tokenizer,
+            builder.processor,
+            chat_template_kwargs=builder.chat_template_kwargs,
+            mm_processor_kwargs=builder.mm_processor_kwargs,
+            allowed_append_roles=builder.allowed_append_roles,
+        )
+    if type(builder) is DeepSeekV4ContinuousTokenBuilder:
+        return _SFTDeepSeekV4ContinuousTokenBuilder(
+            builder.tokenizer,
+            chat_template_kwargs=builder.chat_template_kwargs,
+            allowed_append_roles=builder.allowed_append_roles,
+        )
+    if isinstance(builder, _SFTMiniMaxVLContinuousTokenBuilder | _SFTDeepSeekV4ContinuousTokenBuilder):
+        return builder
+    if isinstance(builder, MiniMaxVLContinuousTokenBuilder | DeepSeekV4ContinuousTokenBuilder):
+        # Reconstructing a custom runtime subclass would discard its state and overrides.
+        raise ValueError(
+            f"SFT cannot automatically adapt custom builder {type(builder).__name__}; "
+            "inherit the matching SFT adapter or use a custom SFT dataset"
+        )
+    return builder
+
+
+def validate_sft_tool_support(
+    builder: ContinuousTokenBuilder,
+    messages: list[dict[str, Any]],
+    *,
+    tools: list[dict[str, Any]] | None = None,
+) -> None:
+    """Reject SFT input information that a legacy VL protocol cannot preserve."""
+    if isinstance(builder, MiniMaxVLContinuousTokenBuilder):
+        _validate_minimax_sft_tools(builder, messages, tools=tools)
+        return
+    if not isinstance(builder, KimiVLContinuousTokenBuilder):
+        return
+    # VL rendering also accepts tool schemas through template kwargs.
+    if tools or builder.chat_template_kwargs.get("tools"):
+        raise ValueError("Kimi-VL SFT does not support structured tool schemas")
+    for message in messages:
+        if message.get("role") == "tool":
+            raise ValueError("Kimi-VL SFT does not support structured tool response messages")
+        if message.get("role") == "assistant" and message.get("tool_calls"):
+            raise ValueError("Kimi-VL SFT does not support structured assistant tool calls")
+
+
+def _validate_minimax_sft_tools(
+    builder: MiniMaxVLContinuousTokenBuilder,
+    messages: list[dict[str, Any]],
+    *,
+    tools: list[dict[str, Any]] | None,
+) -> None:
+    """Detect whole declarations/responses omitted by the selected SFT templates."""
+    template_kwargs = dict(builder.chat_template_kwargs)
+    configured_tools = template_kwargs.pop("tools", None)
+    tools = tools or configured_tools
+    first_assistant = next(
+        (i for i, message in enumerate(messages) if message.get("role") == "assistant"), len(messages)
+    )
+    if any(message.get("role") == "tool" for message in messages[:first_assistant]):
+        raise ValueError(
+            "MiniMax-VL SFT does not support initial tool responses; include the preceding assistant tool call"
+        )
+    if tools and first_assistant:
+        rendered_prompts = [
+            apply_chat_template(
+                builder.processor,
+                _copy_messages_for_template(messages[:first_assistant]),
+                tokenize=False,
+                add_generation_prompt=True,
+                tools=schemas,
+                **template_kwargs,
+            )
+            for schemas in (None, [tool.get("function", tool) for tool in tools])
+        ]
+        if rendered_prompts[0] == rendered_prompts[1]:
+            raise ValueError("MiniMax-VL SFT selected a chat template that does not render tool schemas")
+
+    function_groups = []
+    previous_messages = []
+    for group in builder._iter_append_groups(messages):
+        if group[0].get("role") == "tool":
+            function_groups.append(
+                [
+                    {
+                        "role": "function",
+                        "name": _resolve_required_tool_name(message, index, group, previous_messages),
+                        "content": [{"type": "text", "text": _stringify_tool_content(message.get("content", ""))}],
+                    }
+                    for index, message in enumerate(group)
+                ]
+            )
+        previous_messages.extend(group)
+    if function_groups:
+        # A batch permits an empty conversation and uses the same tokenizer/template
+        # as the runtime function-response hook, without processing images or encoding.
+        rendered = builder.tokenizer.apply_chat_template(
+            [[], *function_groups], tokenize=False, add_generation_prompt=False, **template_kwargs
+        )
+        if any(response == rendered[0] for response in rendered[1:]):
+            raise ValueError("MiniMax-VL SFT selected a chat template that does not render tool responses")
 
 
 class _AssistantReconstructor:
@@ -190,12 +385,40 @@ class _GptOssReconstructor(_AssistantReconstructor):
 class _QwenReconstructor(_AssistantReconstructor):
     def _prepare_message(self, message: dict[str, Any]) -> dict[str, Any]:
         enable_thinking = self.builder.chat_template_kwargs.get("enable_thinking")
+        if enable_thinking is not False:
+            return message
         if isinstance(message.get("reasoning_content"), str):
-            if enable_thinking is not False:
-                return message
             rendered_message = dict(message)
             rendered_message["reasoning_content"] = ""
             return rendered_message
+        return self._split_embedded_reasoning(message, keep_reasoning=False)
+
+    def _render_text(
+        self,
+        messages: list[dict[str, Any]],
+        *,
+        add_generation_prompt: bool,
+        tools: list[dict[str, Any]] | None,
+    ) -> str:
+        render_kwargs = {"add_generation_prompt": add_generation_prompt, "tools": tools}
+        if messages and messages[-1].get("role") == "assistant":
+            message = messages[-1]
+            prepared = self._split_embedded_reasoning(message, keep_reasoning=True)
+            if prepared is not message and self.builder.chat_template_kwargs.get("enable_thinking") is not False:
+                prepared_text = super()._render_text([*messages[:-1], prepared], **render_kwargs)
+                without_reasoning = {key: value for key, value in prepared.items() if key != "reasoning_content"}
+                empty_text = super()._render_text([*messages[:-1], without_reasoning], **render_kwargs)
+                # Qwen3/3.5's raw-content parser can truncate literal <think>
+                # tags. Use the explicit field only when this actual render
+                # consumes it; Qwen2.5 and Qwen3-VL can ignore that field.
+                if prepared_text != empty_text:
+                    return prepared_text
+        return super()._render_text(messages, **render_kwargs)
+
+    @staticmethod
+    def _split_embedded_reasoning(message: dict[str, Any], *, keep_reasoning: bool) -> dict[str, Any]:
+        if isinstance(message.get("reasoning_content"), str):
+            return message
         content = message.get("content")
         content_is_text_blocks = isinstance(content, list) and all(
             isinstance(block, dict) and block.get("type") == "text" for block in content
@@ -211,7 +434,7 @@ class _QwenReconstructor(_AssistantReconstructor):
 
         reasoning_content, answer_content = content_text[len("<think>") :].split("</think>", 1)
         rendered_message = dict(message)
-        rendered_message["reasoning_content"] = reasoning_content if enable_thinking is not False else ""
+        rendered_message["reasoning_content"] = reasoning_content if keep_reasoning else ""
         rendered_message["content"] = (
             [{"type": "text", "text": answer_content}] if content_is_text_blocks else answer_content
         )
@@ -576,10 +799,12 @@ class _DeepSeekV4Reconstructor(_AssistantReconstructor):
 
 def _prepare_minimax_legacy_assistant_message(message: dict[str, Any]) -> dict[str, Any]:
     """Reconstruct MiniMax-01's textual function-call continuation."""
-    if not message.get("tool_calls") or _stringify_tool_content(message.get("content", "")):
+    if not message.get("tool_calls"):
         return message
 
-    call_parts = []
+    # Natural-language content and structured calls are separate fields. Callers
+    # with an already serialized function call can provide it as content alone.
+    call_parts = [_stringify_tool_content(message.get("content", ""))]
     for tool_call in message["tool_calls"]:
         function = tool_call.get("function", tool_call)
         name = function.get("name")
@@ -639,8 +864,8 @@ class _KimiVLReconstructor(_AssistantReconstructor):
         tools: list[dict[str, Any]] | None,
         previous_messages: list[dict[str, Any]] | None,
     ) -> list[int]:
-        self.builder._reject_tools(tools)
-        self.builder._reject_structured_messages([message])
+        # Direct SFT callers may supply history that never passed through the dataset.
+        validate_sft_tool_support(self.builder, [*(previous_messages or []), message], tools=tools)
         return super().reconstruct(message, tools=None, previous_messages=previous_messages)
 
     def _normalize_ids(self, assistant_token_ids: list[int], message: dict[str, Any]) -> list[int]:
@@ -651,49 +876,6 @@ class _KimiVLReconstructor(_AssistantReconstructor):
                 if token_id == im_end_id:
                     return list(assistant_token_ids[: index + 1])
         return super()._normalize_ids(assistant_token_ids, message)
-
-
-class _DeepSeekVL2Reconstructor(_DeepSeekReconstructor):
-    def reconstruct(
-        self,
-        message: dict[str, Any],
-        *,
-        tools: list[dict[str, Any]] | None,
-        previous_messages: list[dict[str, Any]] | None,
-    ) -> list[int]:
-        del previous_messages
-        self._require_assistant(message)
-        if tools:
-            raise ValueError("DeepSeek-VL2 Continuous Token does not support tool schemas")
-        if message.get("tool_calls"):
-            raise ValueError("DeepSeek-VL2 Continuous Token does not support structured assistant tool calls")
-
-        synthetic_prompt = [_SYNTHETIC_USER_MESSAGE]
-        prompt_token_ids = self.builder._render_via_processor(
-            synthetic_prompt,
-            [],
-        )
-        conversation, images = self.builder._to_vl2_conversation(
-            [*synthetic_prompt, message],
-            [],
-            add_generation_prompt=False,
-        )
-        completed = self.builder.processor.__call__(
-            conversations=conversation,
-            images=images,
-            force_batchify=True,
-            inference_mode=False,
-        )
-        completed_token_ids = normalize_token_ids(completed.input_ids[0].tolist())
-        if completed_token_ids[: len(prompt_token_ids)] != prompt_token_ids:
-            raise ValueError(
-                "Continuous Token assistant encoding requires the processor generation prompt to be a token-id "
-                "prefix of the completed assistant turn"
-            )
-        assistant_token_ids = completed_token_ids[len(prompt_token_ids) :]
-        if not assistant_token_ids:
-            raise ValueError("Continuous Token assistant encoding produced an empty token-id suffix")
-        return self._normalize_ids(assistant_token_ids, message)
 
 
 _RECONSTRUCTORS: dict[type[ContinuousTokenBuilder], type[_AssistantReconstructor]] = {
@@ -707,7 +889,6 @@ _RECONSTRUCTORS: dict[type[ContinuousTokenBuilder], type[_AssistantReconstructor
     DeepSeekV4ContinuousTokenBuilder: _DeepSeekV4Reconstructor,
     MiniMaxVLContinuousTokenBuilder: _MiniMaxVLReconstructor,
     KimiVLContinuousTokenBuilder: _KimiVLReconstructor,
-    DeepSeekVL2ContinuousTokenBuilder: _DeepSeekVL2Reconstructor,
 }
 
 
@@ -719,6 +900,8 @@ def _resolve_reconstructor(builder: ContinuousTokenBuilder) -> type[_AssistantRe
         handler = _RECONSTRUCTORS.get(cls)
         if handler is not None:
             return handler
+        if cls is DeepSeekVL2ContinuousTokenBuilder:
+            raise ValueError("DeepSeek-VL2 SFT is not supported; use a supported model family or a custom SFT dataset")
     return _AssistantReconstructor
 
 
